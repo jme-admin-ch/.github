@@ -1,0 +1,97 @@
+name: Build CDCT Examples
+
+on:
+  workflow_call:
+    inputs:
+      triggered-manually:
+        description: 'Set to true when the calling workflow was triggered via workflow_dispatch'
+        default: false
+        type: boolean
+  workflow_dispatch:
+
+jobs:
+  check-membership:
+    if: inputs.triggered-manually == true || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const actor = context.actor;
+            let isMember = false;
+            try {
+              const res = await github.rest.orgs.checkMembershipForUser({
+                org: 'jme-admin-ch',
+                username: actor,
+              });
+              isMember = res.status === 204;
+            } catch (_) {}
+            if (!isMember) {
+              core.setFailed(`${actor} is not a member of jme-admin-ch`);
+            }
+
+  build:
+    needs: [check-membership]
+    if: always() && (needs.check-membership.result == 'success' || needs.check-membership.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consumer
+        uses: actions/checkout@v4
+        with:
+          repository: jme-admin-ch/jme-cdct-consumer-example
+          path: consumer
+
+      - name: Checkout consumer-2
+        uses: actions/checkout@v4
+        with:
+          repository: jme-admin-ch/jme-cdct-consumer-2-example
+          path: consumer-2
+
+      - name: Checkout provider
+        uses: actions/checkout@v4
+        with:
+          repository: jme-admin-ch/jme-cdct-provider-example
+          path: provider
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Start Pact Broker
+        run: |
+          docker compose \
+            -f consumer/docker/docker-compose.yml \
+            up -d --wait --wait-timeout 120
+
+      - name: Run consumer tests (publish pacts)
+        working-directory: consumer
+        run: ./mvnw --batch-mode verify -P local-pact-broker
+
+      - name: Run consumer-2 tests (publish pacts)
+        working-directory: consumer-2
+        run: ./mvnw --batch-mode verify -P local-pact-broker
+
+      - name: Copy Maven settings for provider integration tests
+        run: |
+          cp "$HOME/.m2/settings.xml" provider/settings.xml 2>/dev/null \
+            || echo '<settings/>' > provider/settings.xml
+
+      - name: Run provider verification
+        working-directory: provider
+        run: ./mvnw --batch-mode verify
+
+      - name: Stop Pact Broker
+        if: always()
+        run: |
+          docker compose \
+            -f consumer/docker/docker-compose.yml \
+            down -t 60
+
+  notify-on-failure:
+    needs: build
+    if: failure()
+    uses: jme-admin-ch/.github/.github/workflows/notify-on-failure.yml@main
+    permissions:
+      contents: write
