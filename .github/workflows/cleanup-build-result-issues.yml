@@ -1,0 +1,78 @@
+name: Cleanup Build Result Issues
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Create a short-lived token for every repository in the app installation.
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.BUILD_CLEANUP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BUILD_CLEANUP_APP_PRIVATE_KEY }}
+          owner: jme-admin-ch
+          permission-contents: read
+          permission-issues: write
+
+      # Find tracking issues across the organization and close deleted branches.
+      - name: Close issues for deleted branches
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const owner = 'jme-admin-ch';
+            const trackingLabel = 'automated-build-failure';
+            const issues = await github.paginate(
+              github.rest.search.issuesAndPullRequests,
+              {
+                q:
+                  `org:${owner} is:issue is:open ` +
+                  `label:${trackingLabel}`,
+                per_page: 100,
+              }
+            );
+
+            core.info(`Found ${issues.length} open build tracking issue(s).`);
+            let closedIssues = 0;
+
+            for (const issue of issues) {
+              const match = issue.body?.match(
+                /<!-- automated-build-issue:[^: ]+:([^ ]+) -->/
+              );
+              if (!match) continue;
+
+              const repo = issue.repository_url.split('/').pop();
+              const branch = decodeURIComponent(match[1]);
+              try {
+                await github.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `heads/${branch}`,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  state_reason: 'completed',
+                });
+                closedIssues++;
+                core.info(
+                  `Closed ${owner}/${repo}#${issue.number} for deleted ` +
+                  `branch '${branch}'.`
+                );
+              }
+            }
+
+            core.info(`Closed ${closedIssues} stale build tracking issue(s).`);
