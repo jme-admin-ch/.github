@@ -1,0 +1,325 @@
+name: Notify Build Result
+
+on:
+  workflow_call:
+    inputs:
+      result:
+        description: 'Result of the build job'
+        required: true
+        type: string
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: build-notification-${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      # Resolve the branch, commit, and open PRs, and ignore results from stale builds.
+      - name: Resolve build context
+        id: build-context
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pullRequest = context.payload.pull_request;
+
+            // Tag builds do not have a long-lived branch issue to maintain.
+            if (context.ref.startsWith('refs/tags/')) {
+              core.info(`Ignoring tag build '${context.ref}'.`);
+              core.setOutput('current', 'false');
+              return;
+            }
+
+            const branch = pullRequest
+              ? pullRequest.head.ref
+              : context.ref.replace(/^refs\/heads\//, '');
+            const buildSha = pullRequest ? pullRequest.head.sha : context.sha;
+            let pullRequests = [];
+
+            // Only the result for the current PR or branch head may change notifications.
+            if (pullRequest) {
+              const currentPr = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: pullRequest.number,
+              });
+              if (currentPr.data.head.sha !== buildSha) {
+                core.info(
+                  `Ignoring stale PR build ${buildSha}; ` +
+                  `current head is ${currentPr.data.head.sha}.`
+                );
+                core.setOutput('current', 'false');
+                return;
+              }
+              if (currentPr.data.state === 'open') {
+                pullRequests = [currentPr.data.number];
+              }
+            } else {
+              try {
+                const currentRef = await github.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `heads/${branch}`,
+                });
+                if (currentRef.data.object.sha !== buildSha) {
+                  core.info(
+                    `Ignoring stale branch build ${buildSha}; ` +
+                    `current head is ${currentRef.data.object.sha}.`
+                  );
+                  core.setOutput('current', 'false');
+                  return;
+                }
+              } catch (error) {
+                if (error.status === 404) {
+                  core.info(`Ignoring result for deleted branch '${branch}'.`);
+                  core.setOutput('current', 'false');
+                  return;
+                }
+                throw error;
+              }
+
+              // A push build may belong to one or more open PRs in this repository.
+              const associated = await github.paginate(
+                github.rest.repos.listPullRequestsAssociatedWithCommit,
+                { owner, repo, commit_sha: buildSha, per_page: 100 }
+              );
+              pullRequests = associated
+                .filter(pr =>
+                  pr.state === 'open' &&
+                  pr.head.repo?.full_name === `${owner}/${repo}` &&
+                  pr.head.ref === branch
+                )
+                .map(pr => pr.number);
+            }
+
+            core.setOutput('branch', branch);
+            core.setOutput('build-sha', buildSha);
+            core.setOutput('pull-requests', JSON.stringify(pullRequests));
+            core.setOutput('current', 'true');
+
+      # Keep one open issue per failing branch and link any related PRs to that issue.
+      - name: Handle failed build
+        if: inputs.result == 'failure' && steps.build-context.outputs.current == 'true'
+        uses: actions/github-script@v7
+        env:
+          BRANCH: ${{ steps.build-context.outputs.branch }}
+          BUILD_SHA: ${{ steps.build-context.outputs.build-sha }}
+          PULL_REQUESTS: ${{ steps.build-context.outputs.pull-requests }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const branch = process.env.BRANCH;
+            const buildSha = process.env.BUILD_SHA;
+            const pullRequests = JSON.parse(process.env.PULL_REQUESTS);
+            const trackingLabel = 'automated-build-failure';
+            const branchMarker =
+              `<!-- automated-build-issue:` +
+              `${encodeURIComponent(context.workflow)}:` +
+              `${encodeURIComponent(branch)} -->`;
+            const failureMarker =
+              `<!-- automated-build-failure:` +
+              `${encodeURIComponent(context.workflow)} -->`;
+            const prMarker =
+              `<!-- automated-build-result:` +
+              `${encodeURIComponent(context.workflow)} -->`;
+            const runUrl =
+              `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            // Ensure the tracking label exists before using it as a server-side filter.
+            try {
+              await github.rest.issues.getLabel({
+                owner,
+                repo,
+                name: trackingLabel,
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: trackingLabel,
+                  color: 'd73a4a',
+                  description: 'Tracks automated build failures',
+                });
+              } catch (createError) {
+                // Another workflow may have created the label concurrently.
+                if (createError.status !== 422) throw createError;
+              }
+            }
+
+            // Locate the branch issue by its stable hidden marker, not by its title.
+            const allIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: 'all',
+                labels: trackingLabel,
+                per_page: 100,
+              }
+            );
+            let issue = allIssues.find(candidate =>
+              !candidate.pull_request &&
+              candidate.body?.includes(branchMarker)
+            );
+
+            // Create the branch issue once and reopen it after a later regression.
+            if (!issue) {
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title: `Automated build failure: ${context.workflow} / ${branch}`,
+                body:
+                  `${branchMarker}\n` +
+                  `This issue tracks failures of \`${context.workflow}\` ` +
+                  `on branch \`${branch}\`.`,
+                labels: [trackingLabel],
+              });
+              issue = created.data;
+            } else if (issue.state !== 'open') {
+              const reopened = await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: 'open',
+              });
+              issue = reopened.data;
+            }
+
+            // Keep only the latest automated failure comment so the issue stays compact.
+            const issueComments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: issue.number, per_page: 100 }
+            );
+            for (const comment of issueComments) {
+              if (
+                comment.user?.login === 'github-actions[bot]' &&
+                comment.body?.includes(failureMarker)
+              ) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: comment.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issue.number,
+              body:
+                `${failureMarker}\n` +
+                `❌ Build failed in \`${repo}\` on \`${branch}\`.\n\n` +
+                `**Commit:** \`${buildSha}\`\n\n` +
+                `**Run:** ${runUrl}\n\n` +
+                `CC: @dominique-gueniat-bit @fabien-cerf-bit ` +
+                `@laris-jacobs-bit @lorenz-ammon-bit ` +
+                `@matthias-fritschi-bit @marko-nalis-bit ` +
+                `@mike-rothenbuehler-bit`,
+            });
+
+            // Keep one marker-based PR comment linking back to the branch issue.
+            for (const pullNumber of pullRequests) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pullNumber, per_page: 100 }
+              );
+              const existing = comments.find(comment =>
+                comment.user?.login === 'github-actions[bot]' &&
+                comment.body?.includes(prMarker)
+              );
+              const body =
+                `${prMarker}\n` +
+                `❌ The build for \`${branch}\` failed.\n\n` +
+                `Details: #${issue.number}`;
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  body,
+                });
+              }
+            }
+
+      # Close recovered branch issues, remove PR notices, and clean up deleted branches.
+      - name: Handle successful build
+        if: inputs.result == 'success' && steps.build-context.outputs.current == 'true'
+        uses: actions/github-script@v7
+        env:
+          BRANCH: ${{ steps.build-context.outputs.branch }}
+          PULL_REQUESTS: ${{ steps.build-context.outputs.pull-requests }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const branch = process.env.BRANCH;
+            const pullRequests = JSON.parse(process.env.PULL_REQUESTS);
+            const trackingLabel = 'automated-build-failure';
+            const branchMarker =
+              `<!-- automated-build-issue:` +
+              `${encodeURIComponent(context.workflow)}:` +
+              `${encodeURIComponent(branch)} -->`;
+            const prMarker =
+              `<!-- automated-build-result:` +
+              `${encodeURIComponent(context.workflow)} -->`;
+
+            const allIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: 'all',
+                labels: trackingLabel,
+                per_page: 100,
+              }
+            );
+            const issue = allIssues.find(candidate =>
+              !candidate.pull_request &&
+              candidate.body?.includes(branchMarker)
+            );
+
+            // A successful current build resolves the issue for this branch.
+            if (issue?.state === 'open') {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+            }
+
+            // Remove the temporary failure link from every related open PR.
+            for (const pullNumber of pullRequests) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pullNumber, per_page: 100 }
+              );
+              for (const comment of comments) {
+                if (
+                  comment.user?.login === 'github-actions[bot]' &&
+                  comment.body?.includes(prMarker)
+                ) {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: comment.id,
+                  });
+                }
+              }
+            }

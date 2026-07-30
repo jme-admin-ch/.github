@@ -51,7 +51,14 @@ jobs:
         with:
           java-version: '25'
           distribution: 'temurin'
-          cache: 'maven'
+
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-jdk-25-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-jdk-25-
 
       - name: Start Pact Broker
         run: |
@@ -74,9 +81,13 @@ jobs:
             -f consumer/docker/docker-compose.yml \
             down -t 60
 
-  notify-on-failure:
+  notify-build-result:
     needs: build
-    if: failure()
-    uses: jme-admin-ch/.github/.github/workflows/notify-on-failure.yml@main
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'failure')
+    uses: jme-admin-ch/.github/.github/workflows/notify-build-result.yml@main
+    with:
+      result: ${{ needs.build.result }}
     permissions:
-      contents: write
+      contents: read
+      issues: write
+      pull-requests: write

@@ -47,15 +47,25 @@ jobs:
         with:
           java-version: ${{ inputs.java-version }}
           distribution: 'temurin'
-          cache: 'maven'
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-jdk-${{ inputs.java-version }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-jdk-${{ inputs.java-version }}-
       - name: Copy Maven settings for sub-process builds
         run: cp "$HOME/.m2/settings.xml" settings.xml 2>/dev/null || echo '<settings/>' > settings.xml
       - name: Build with Maven
         run: env -u CI ./mvnw ${{ inputs.maven-args }}
 
-  notify-on-failure:
+  notify-build-result:
     needs: build
-    if: failure()
-    uses: jme-admin-ch/.github/.github/workflows/notify-on-failure.yml@main
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'failure')
+    uses: jme-admin-ch/.github/.github/workflows/notify-build-result.yml@main
+    with:
+      result: ${{ needs.build.result }}
     permissions:
-      contents: write
+      contents: read
+      issues: write
+      pull-requests: write
