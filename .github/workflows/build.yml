@@ -4,7 +4,7 @@ on:
   workflow_call:
     secrets:
       MS_TEAMS_WEBHOOK:
-        required: true
+        required: false
     inputs:
       java-version:
         description: 'Java version to use'
@@ -75,10 +75,10 @@ jobs:
 
   notify-ms-teams:
     needs: build
-    if: always() && (needs.build.result == 'success' || needs.build.result == 'failure' || needs.build.result == 'cancelled')
+    if: always() && needs.build.result == 'failure'
     runs-on: ubuntu-latest
     steps:
-      - name: Notify Microsoft Teams
+      - name: Notify Microsoft Teams in case of build failure
         env:
           MS_TEAMS_WEBHOOK: ${{ secrets.MS_TEAMS_WEBHOOK }}
           BUILD_STATUS: ${{ needs.build.result }}
