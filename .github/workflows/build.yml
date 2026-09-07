@@ -83,6 +83,7 @@ jobs:
           MS_TEAMS_WEBHOOK: ${{ secrets.MS_TEAMS_WEBHOOK }}
           BUILD_STATUS: ${{ needs.build.result }}
         run: |
+          set -o pipefail
           if [ -z "$MS_TEAMS_WEBHOOK" ]; then
             echo "MS_TEAMS_WEBHOOK is not configured"
             exit 0
