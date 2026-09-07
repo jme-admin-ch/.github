@@ -2,6 +2,9 @@ name: Reusable Build
 
 on:
   workflow_call:
+    secrets:
+      MS_TEAMS_WEBHOOK:
+        required: true
     inputs:
       java-version:
         description: 'Java version to use'
@@ -69,3 +72,119 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+
+  notify-ms-teams:
+    needs: build
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'failure' || needs.build.result == 'cancelled')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Microsoft Teams
+        env:
+          MS_TEAMS_WEBHOOK: ${{ secrets.MS_TEAMS_WEBHOOK }}
+          BUILD_STATUS: ${{ needs.build.result }}
+        run: |
+          if [ -z "$MS_TEAMS_WEBHOOK" ]; then
+            echo "MS_TEAMS_WEBHOOK is not configured"
+            exit 0
+          fi
+
+          case "$BUILD_STATUS" in
+            success)
+              STATUS_ICON="🟢"
+              STATUS_TEXT="Success"
+              ;;
+            failure)
+              STATUS_ICON="🔴"
+              STATUS_TEXT="Failed"
+              ;;
+            cancelled)
+              STATUS_ICON="🟡"
+              STATUS_TEXT="Cancelled"
+              ;;
+            *)
+              STATUS_ICON="⚪"
+              STATUS_TEXT="$BUILD_STATUS"
+              ;;
+          esac
+
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          jq -n \
+            --arg workflow "${{ github.workflow }}" \
+            --arg project "${{ github.repository }}" \
+            --arg status "$STATUS_TEXT" \
+            --arg statusIcon "$STATUS_ICON" \
+            --arg repository "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg commit "${{ github.sha }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg runId "${{ github.run_id }}" \
+            --arg runUrl "$RUN_URL" \
+            '{
+              type: "message",
+              attachments: [
+                {
+                  contentType: "application/vnd.microsoft.card.adaptive",
+                  content: {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    type: "AdaptiveCard",
+                    version: "1.4",
+                    body: [
+                      {
+                        type: "TextBlock",
+                        text: "GitHub Actions",
+                        weight: "Bolder",
+                        size: "Medium"
+                      },
+                      {
+                        type: "TextBlock",
+                        text: ($workflow + " • " + $project),
+                        weight: "Bolder",
+                        size: "Large",
+                        wrap: true
+                      },
+                      {
+                        type: "FactSet",
+                        facts: [
+                          {
+                            title: "Status",
+                            value: ($statusIcon + " " + $status)
+                          },
+                          {
+                            title: "Repository",
+                            value: $repository
+                          },
+                          {
+                            title: "Branch",
+                            value: $branch
+                          },
+                          {
+                            title: "Commit",
+                            value: ($commit[0:7])
+                          },
+                          {
+                            title: "Triggered by",
+                            value: $actor
+                          },
+                          {
+                            title: "Run",
+                            value: ("#" + $runId)
+                          }
+                        ]
+                      }
+                    ],
+                    actions: [
+                      {
+                        type: "Action.OpenUrl",
+                        title: "View GitHub Actions run",
+                        url: $runUrl
+                      }
+                    ]
+                  }
+                }
+              ]
+            }' |
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary @- \
+            "$MS_TEAMS_WEBHOOK"
