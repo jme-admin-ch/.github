@@ -10,6 +10,10 @@ on:
         description: 'Java version to use'
         default: '25'
         type: string
+      node-version:
+        description: 'Node version to set up for the build, none when empty'
+        default: ''
+        type: string
       maven-args:
         description: 'Arguments passed to ./mvnw'
         default: '--batch-mode verify'
@@ -50,6 +54,10 @@ jobs:
         with:
           java-version: ${{ inputs.java-version }}
           distribution: 'temurin'
+      - uses: actions/setup-node@v4
+        if: inputs.node-version != ''
+        with:
+          node-version: ${{ inputs.node-version }}
       - name: Cache Maven repository
         uses: actions/cache@v4
         with:
